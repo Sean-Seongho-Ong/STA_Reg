@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    networks:
+      - chatbot-network
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - MODEL_DIR=/app/model
+    volumes:
+      - ./model:/app/model
+    networks:
+      - chatbot-network
+    depends_on:
+      - qdrant
+
+  qdrant:
+    image: qdrant/qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - chatbot-network
+
+networks:
+  chatbot-network:
+    driver: bridge
+
+volumes:
+  qdrant_data: 
