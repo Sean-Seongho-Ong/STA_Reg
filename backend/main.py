@@ -18,11 +18,19 @@ from langchain.vectorstores import Qdrant
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from qdrant_client import QdrantClient
+from huggingface_hub import login
 import qdrant_client # 명시적 임포트 추가
 import traceback # 오류 로깅용
 from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 from langchain_core.documents import Document # Document 타입 명시적 임포트
+from dotenv import load_dotenv
+from peft import PeftModel, PeftConfig
+
+
+load_dotenv()
+
+login(token=os.getenv("HF_TOKEN"))
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +46,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"]
+)
+
+BASE_MODEL = "meta-llama/Llama-2-13b-chat-hf"
+ADAPTER_REPO = "Sean-Ong/STA_Reg"
+
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, token=os.getenv("HF_TOKEN"))
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL,
+    device_map="auto",
+    torch_dtype="auto",
+    token=os.getenv("HF_TOKEN")
+)
+
+model = PeftModel.from_pretrained(
+    base_model,
+    ADAPTER_REPO,
+    token=os.getenv("HF_TOKEN")
 )
 
 # 모델 경로 설정
