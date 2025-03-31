@@ -5,3 +5,4 @@ python-dotenv==1.0.0
 langchain>=0.1.0
 langchain-core>=0.1.8
 langgraph>=0.0.17 
+torch==2.1.2+cpu -f https://download.pytorch.org/whl/torch_stable.html
