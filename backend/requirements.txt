@@ -9,3 +9,4 @@ huggingface-hub
 torch
 peft
 transformers
+langchain-community
