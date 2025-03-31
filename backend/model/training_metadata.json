@@ -1,0 +1,21 @@
+{
+  "run_id": "20250326",
+  "training_complete_time": "2025-03-26 15:09:55",
+  "data_file": "C:\\Regluatory SaaS\\Platform SaaS\\Machine Learning\\fcc_dataset_20000_balanced.json",
+  "base_model": "meta-llama/Llama-2-13b-chat-hf",
+  "is_continued_training": true,
+  "previous_model_path": "C:\\Regluatory SaaS\\Platform SaaS\\Machine Learning\\fcc_llama2_13b_chat_qlora_final\\model_20250325_v1",
+  "trained_parameters": {
+    "lora_rank": 32,
+    "lora_alpha": 256,
+    "learning_rate": 0.0001,
+    "batch_size": 4,
+    "epochs": 1
+  },
+  "stats": {
+    "train_samples": 16000,
+    "validation_samples": 2000,
+    "test_samples": 2000,
+    "training_duration_minutes": 140.9669239083926
+  }
+}
