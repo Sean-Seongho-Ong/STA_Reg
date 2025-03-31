@@ -7,3 +7,5 @@ langchain-core>=0.1.8
 langgraph==0.3.21 
 huggingface-hub
 torch
+peft
+transformers
