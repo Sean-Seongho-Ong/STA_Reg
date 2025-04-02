@@ -26,6 +26,7 @@ from langgraph.graph import StateGraph, END
 from langchain_core.documents import Document # Document 타입 명시적 임포트
 from dotenv import load_dotenv
 from peft import PeftModel, PeftConfig
+import shutil
 
 
 load_dotenv()
@@ -53,16 +54,35 @@ ADAPTER_REPO = "Sean-Ong/STA_Reg"
 
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, token=os.getenv("HF_TOKEN"))
 
+# offload 디렉토리 설정
+OFFLOAD_DIR = "./offload"
+if os.path.exists(OFFLOAD_DIR):
+    shutil.rmtree(OFFLOAD_DIR)
+os.makedirs(OFFLOAD_DIR, exist_ok=True)
+
+# 4비트 양자화 설정
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    llm_int8_enable_fp32_cpu_offload=True  # CPU 오프로드 활성화
+)
+
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     device_map="auto",
-    torch_dtype="auto",
-    token=os.getenv("HF_TOKEN")
+    quantization_config=quantization_config,
+    torch_dtype=torch.float16,
+    offload_folder=OFFLOAD_DIR,
+    token=os.getenv("HF_TOKEN"),
+    low_cpu_mem_usage=True  # 낮은 CPU 메모리 사용
 )
 
 model = PeftModel.from_pretrained(
     base_model,
     ADAPTER_REPO,
+    offload_folder=OFFLOAD_DIR,
     token=os.getenv("HF_TOKEN")
 )
 
@@ -136,7 +156,8 @@ def load_model():
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True
+        bnb_4bit_use_double_quant=True,
+        llm_int8_enable_fp32_cpu_offload=True  # CPU 오프로드 활성화
     )
     
     # 기본 모델 로드
@@ -294,6 +315,14 @@ async def startup_event():
              langgraph_app = None
     else:
         logger.warning("RAG components not initialized, skipping LangGraph workflow compilation.")
+
+    torch.cuda.empty_cache()  # GPU 메모리 캐시 정리
+
+    # 기존 offload 디렉토리 삭제 및 재생성
+    OFFLOAD_DIR = "./offload"
+    if os.path.exists(OFFLOAD_DIR):
+        shutil.rmtree(OFFLOAD_DIR)
+    os.makedirs(OFFLOAD_DIR, exist_ok=True)
 
 # Pydantic 모델
 class ChatMessage(BaseModel):
