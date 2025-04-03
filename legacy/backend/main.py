@@ -12,7 +12,7 @@ import uuid
 import asyncio
 from fastapi.responses import StreamingResponse
 import sys
-from langchain_community.llms import HuggingFacePipeline
+from langchain_community.llms import HuggingFacePipeline.
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Qdrant
 from langchain.chains import RetrievalQA
