@@ -3,7 +3,148 @@ base_model: meta-llama/Llama-2-13b-chat-hf
 library_name: peft
 ---
 
-# Model Card for Model ID
+# QLoRA LLM 챗봇 API
+
+FCC 규제 관련 문서를 기반으로 한 QLoRA 파인튜닝된 Llama2 챗봇 API 서버입니다.
+
+## 주요 기능
+
+- **QLoRA 파인튜닝된 LLM**: Llama2 13B 모델을 기반으로 FCC 규제 문서에 특화된 응답 생성
+- **RAG (Retrieval-Augmented Generation)**: Qdrant 벡터 데이터베이스를 활용한 문서 검색 및 응답 생성
+- **스트리밍 응답**: 실시간 응답 생성 지원
+- **요약 기능**: 긴 응답에 대한 자동 요약 제공
+
+## 시스템 요구사항
+
+- Python 3.9 이상
+- CUDA 지원 GPU (최소 16GB VRAM 권장)
+- 최소 32GB RAM
+- Qdrant 서버 (벡터 데이터베이스)
+
+## 설치 방법
+
+1. 저장소 클론:
+```bash
+git clone [repository_url]
+cd ChatBot_interface_Web/backend
+```
+
+2. 가상환경 생성 및 활성화:
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+venv\\Scripts\\activate   # Windows
+```
+
+3. 의존성 설치:
+```bash
+pip install -r requirements.txt
+```
+
+4. 환경 변수 설정:
+`.env` 파일을 생성하고 다음 변수들을 설정:
+
+```env
+# 환경 설정
+ENV=development  # development 또는 production
+
+# 모델 경로 설정
+LOCAL_MODEL_PATH="path/to/model/directory"
+LOCAL_BASE_MODEL_PATH="path/to/model/llama2"
+LOCAL_ADAPTER_PATH="path/to/model/adapter"
+
+# Qdrant 설정
+QDRANT_HOST="localhost"
+QDRANT_PORT=6333
+COLLECTION_NAME="fcc_kdb_docs"
+
+# Hugging Face 설정
+HF_TOKEN="your_token_here"  # Hugging Face 토큰
+```
+
+## 실행 방법
+
+1. Qdrant 서버 시작:
+```bash
+docker run -p 6333:6333 qdrant/qdrant
+```
+
+2. API 서버 시작:
+```bash
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+## API 엔드포인트
+
+### 1. 채팅 API
+- **엔드포인트**: `/api/chat`
+- **메서드**: POST
+- **요청 형식**:
+```json
+{
+    "messages": [
+        {"role": "user", "content": "질문 내용"}
+    ],
+    "max_tokens": 2048,
+    "temperature": 0.7,
+    "stream": false
+}
+```
+
+### 2. 상태 확인
+- **엔드포인트**: `/api/status`
+- **메서드**: GET
+
+### 3. 건강 체크
+- **엔드포인트**: `/api/health`
+- **메서드**: GET
+
+## 주요 구성 요소
+
+1. **LLM 모듈**
+   - QLoRA 파인튜닝된 Llama2 모델
+   - 4비트 양자화를 통한 메모리 최적화
+   - GPU 오프로딩 지원
+
+2. **RAG 시스템**
+   - Qdrant 벡터 데이터베이스 연동
+   - 문서 임베딩 및 검색
+   - 컨텍스트 기반 응답 생성
+
+3. **파이프라인**
+   - 문서 검색 (Retrieval)
+   - 응답 생성 (Generation)
+   - 요약 (Summarization)
+
+## 개발 가이드
+
+### 디렉토리 구조
+```
+backend/
+├── app/
+│   ├── models/      # 모델 관련 로직
+│   ├── core/        # 핵심 기능
+│   ├── api/         # API 엔드포인트
+│   └── utils/       # 유틸리티 함수
+├── model/          # 모델 파일 저장
+└── main.py         # 앱 진입점
+```
+
+### 환경 변수 설명
+
+- `ENV`: 개발/배포 환경 설정
+- `LOCAL_MODEL_PATH`: 모델 파일 저장 경로
+- `LOCAL_BASE_MODEL_PATH`: Llama2 기본 모델 경로
+- `LOCAL_ADAPTER_PATH`: QLoRA 어댑터 경로
+- `QDRANT_HOST`: Qdrant 서버 주소
+- `QDRANT_PORT`: Qdrant 서버 포트
+- `COLLECTION_NAME`: Qdrant 컬렉션 이름
+
+## 라이선스
+
+[라이선스 정보 추가]
+
+## Model Card for Model ID
 
 <!-- Provide a quick summary of what the model is/does. -->
 

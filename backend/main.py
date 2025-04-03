@@ -18,17 +18,23 @@ from langchain.vectorstores import Qdrant
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from qdrant_client import QdrantClient
-from huggingface_hub import login
-import qdrant_client # 명시적 임포트 추가
-import traceback # 오류 로깅용
+from huggingface_hub import login, snapshot_download
+import qdrant_client
+import traceback
 from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.graph import StateGraph, END
-from langchain_core.documents import Document # Document 타입 명시적 임포트
+from langchain_core.documents import Document
 from dotenv import load_dotenv
-from peft import PeftModel, PeftConfig
 import shutil
-from huggingface_hub import snapshot_download
 
+# GraphState 정의
+class GraphState(TypedDict):
+    """RAG 및 요약 파이프라인 상태"""
+    question: str  # 사용자 원본 질문
+    documents: Sequence[Document]  # 검색된 문서 리스트
+    initial_answer: str  # RAG 파이프라인이 생성한 초기 답변
+    final_answer: str  # 최종 요약된 답변
+    error: Optional[str]  # 오류 발생 시 메시지 저장
 
 load_dotenv()
 
@@ -61,11 +67,97 @@ ADAPTER_REPO = "Sean-Ong/STA_Reg"
 OFFLOAD_DIR = "./offload"
 MODEL_CACHE_DIR = "./model_cache"
 
-# 디렉토리 생성
-for dir_path in [OFFLOAD_DIR, MODEL_CACHE_DIR]:
-    if os.path.exists(dir_path):
-        shutil.rmtree(dir_path)
-    os.makedirs(dir_path, exist_ok=True)
+# 전역 변수 선언
+model = None
+tokenizer = None
+base_model = None
+local_llm = None
+summarization_llm = None
+
+def initialize_model_and_tokenizer():
+    """모델과 토크나이저 초기화 (한 번만 실행)"""
+    global model, tokenizer, base_model, local_llm, summarization_llm
+    
+    try:
+        if ENV == "development":
+            logger.info("개발 환경: 로컬 모델 사용")
+            
+            # 4비트 양자화 설정
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                llm_int8_enable_fp32_cpu_offload=True
+            )
+            
+            # 토크나이저 로드
+            tokenizer = AutoTokenizer.from_pretrained(
+                LOCAL_BASE_MODEL_PATH,
+                use_fast=True,
+                padding_side="left"
+            )
+            
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            # 기본 모델 로드
+            base_model = AutoModelForCausalLM.from_pretrained(
+                LOCAL_BASE_MODEL_PATH,
+                device_map="auto",
+                quantization_config=quantization_config,
+                torch_dtype=torch.float16,
+                offload_folder=OFFLOAD_DIR
+            )
+            
+            # QLoRA 어댑터 로드
+            logger.info(f"로컬 어댑터 로드: {LOCAL_ADAPTER_PATH}")
+            model = PeftModel.from_pretrained(
+                base_model,
+                LOCAL_ADAPTER_PATH,
+                device_map="auto",
+                offload_folder=OFFLOAD_DIR
+            )
+            
+            # 기본 파이프라인 생성
+            pipe = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=512,
+                temperature=0.7,
+                do_sample=True,
+                device_map="auto"
+            )
+            local_llm = HuggingFacePipeline(pipeline=pipe)
+            logger.info("기본 LLM 파이프라인 생성 완료")
+            
+            # 요약용 파이프라인 생성
+            summarization_pipe = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=1024,
+                temperature=0.3,
+                do_sample=True,
+                device_map="auto"
+            )
+            summarization_llm = HuggingFacePipeline(pipeline=summarization_pipe)
+            logger.info("요약용 파이프라인 생성 완료")
+            
+            return True
+        else:
+            logger.info("프로덕션 환경: 원격 모델 사용")
+            # 프로덕션 환경 코드...
+            return False
+            
+    except Exception as e:
+        logger.error(f"모델 초기화 중 오류 발생: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+# 초기 모델 로드 실행
+initialize_model_and_tokenizer()
 
 # 4비트 양자화 설정
 quantization_config = BitsAndBytesConfig(
@@ -91,6 +183,8 @@ def ensure_model_cached(repo_id, cache_dir):
 
 def load_model_and_tokenizer():
     """환경에 따른 모델 및 토크나이저 로드"""
+    global local_llm  # local_llm을 전역 변수로 선언
+    
     try:
         # 토크나이저 로드
         if ENV == "development":
@@ -109,6 +203,9 @@ def load_model_and_tokenizer():
                 padding_side="left",
                 token=os.getenv("HF_TOKEN")
             )
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
         # 기본 모델 로드
         base_model = AutoModelForCausalLM.from_pretrained(
@@ -139,6 +236,19 @@ def load_model_and_tokenizer():
                 offload_folder=OFFLOAD_DIR,
                 token=os.getenv("HF_TOKEN")
             )
+            
+        # local_llm 초기화
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=512,
+            temperature=0.7,
+            do_sample=True,
+            device_map="auto"
+        )
+        local_llm = HuggingFacePipeline(pipeline=pipe)
+        logger.info("LLM 파이프라인 생성 완료")
 
         return model, tokenizer
 
@@ -148,14 +258,76 @@ def load_model_and_tokenizer():
         return None, None
 
 # 모델 로드 실행
-model, tokenizer = load_model_and_tokenizer()
+try:
+    model, tokenizer = load_model_and_tokenizer()
+    if model is None or tokenizer is None:
+        logger.warning("모델 또는 토크나이저 로드 실패. 서버는 제한된 기능으로 실행됩니다.")
+    else:
+        logger.info("모델과 토크나이저가 성공적으로 로드되었습니다.")
+except Exception as e:
+    logger.error(f"모델 초기화 중 오류 발생: {e}")
+    logger.error(traceback.format_exc())
+    model, tokenizer = None, None
 
-if model is None or tokenizer is None:
-    logger.warning("모델 또는 토크나이저 로드 실패. 서버는 제한된 기능으로 실행됩니다.")
-    return
-else:
-    # 기본 LLM 파이프라인 생성
-    from transformers import pipeline
+# RAG 설정
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+COLLECTION_NAME = "fcc_kdb_docs"
+EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5"
+SEARCH_K = 3
+
+@app.on_event("startup")
+async def startup_event():
+    global qdrant_client_instance, embedding_model, vector_store, langgraph_app
+    
+    try:
+        # Qdrant 클라이언트 초기화
+        qdrant_client_instance = QdrantClient(
+            host=QDRANT_HOST,
+            port=QDRANT_PORT
+        )
+        
+        # 컬렉션 존재 여부 확인
+        try:
+            collection_info = qdrant_client_instance.get_collection(collection_name=COLLECTION_NAME)
+            logger.info(f"Qdrant 컬렉션 '{COLLECTION_NAME}' 확인 완료")
+        except Exception as q_err:
+            logger.error(f"Qdrant 컬렉션 오류: {q_err}")
+            return
+        
+        # 임베딩 모델 초기화
+        embedding_model = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+        )
+        logger.info("임베딩 모델 로드 완료")
+        
+        # 벡터 저장소 초기화
+        vector_store = Qdrant(
+            client=qdrant_client_instance,
+            collection_name=COLLECTION_NAME,
+            embeddings=embedding_model
+        )
+        logger.info("벡터 저장소 초기화 완료")
+        
+        # LangGraph 워크플로우 빌드
+        workflow = StateGraph(GraphState)
+        workflow.add_node("retrieve", retrieve_node)
+        workflow.add_node("generate_rag_answer", generate_rag_answer_node)
+        workflow.add_node("summarize", summarize_answer_node)
+        workflow.set_entry_point("retrieve")
+        workflow.add_edge("retrieve", "generate_rag_answer")
+        workflow.add_edge("generate_rag_answer", "summarize")
+        workflow.add_edge("summarize", END)
+        langgraph_app = workflow.compile()
+        logger.info("LangGraph 워크플로우 컴파일 완료")
+        
+    except Exception as e:
+        logger.error(f"startup_event 오류: {e}")
+        logger.error(traceback.format_exc())
+
+# 기본 LLM 파이프라인 생성
+if model is not None and tokenizer is not None:
     try:
         pipe = pipeline(
             "text-generation",
@@ -172,90 +344,27 @@ else:
         logger.error(f"HuggingFacePipeline 생성 중 오류: {str(e)}")
         local_llm = None
 
-    # --- [요약용 수정] 요약 전용 LLM 파이프라인 생성 ---
-    if local_llm: # 기본 LLM 생성 성공 시에만 시도
-         try:
-             logger.info("Creating dedicated pipeline for summarization...")
-             summarization_pipe = pipeline(
-                 "text-generation",
-                 model=model, # 동일 모델 사용
-                 tokenizer=tokenizer, # 동일 토크나이저 사용
-                 max_new_tokens=1024, # <<< 요약 최대 토큰 수 제한 (필요시 조절)
-                 temperature=0.3,    # <<< 낮은 temperature 설정
-                 do_sample=True,        # <<< 샘플링 활성화 (UserWarning 해결 시도)
-                 top_p=0.9,
-                 repetition_penalty=1.4,
-                 device_map="auto"   # device_map 설정 유지
-             )
-             summarization_llm = HuggingFacePipeline(pipeline=summarization_pipe)
-             logger.info("HuggingFacePipeline for Summarization created.")
-         except Exception as e:
-             logger.error(f"Failed to create summarization pipeline: {e}")
-             summarization_llm = None # 실패 시 None 처리
-    # --- 수정 끝 ---
-
-# RAG 컴포넌트 초기화 (기본 LLM 성공 시에만 시도)
-rag_components_initialized = False
-if local_llm:
-    try:
-        logger.info("RAG 컴포넌트 초기화 중...")
-        qdrant_client_instance = init_qdrant_client()
-        
-        # 컬렉션 존재 여부 확인
-        try:
-            collection_info = qdrant_client_instance.get_collection(collection_name=COLLECTION_NAME)
-            points_count = collection_info.points_count
-            logger.info(f"Qdrant 컬렉션 '{COLLECTION_NAME}' 확인 완료. 총 {points_count}개의 포인트가 있습니다.")
-        except Exception as q_err:
-            logger.error(f"Qdrant 컬렉션 '{COLLECTION_NAME}' 접근 오류 또는 존재하지 않음: {q_err}")
-            logger.error("RAG 기능이 제한될 수 있습니다.")
-            return
-
-        logger.info(f"Qdrant 클라이언트 연결 성공 ({QDRANT_HOST}:{QDRANT_PORT})")
-        embedding_model = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
-        )
-        logger.info(f"임베딩 모델 로드 완료: {EMBEDDING_MODEL_NAME}")
-        vector_store = Qdrant(
-            client=qdrant_client_instance,
-            collection_name=COLLECTION_NAME,
-            embeddings=embedding_model,
-            content_payload_key='page_content'
-        )
-        logger.info(f"Qdrant 벡터 저장소 연결 완료 (컬렉션: {COLLECTION_NAME})")
-        rag_components_initialized = True # 성공 시 플래그 설정
-    except Exception as e:
-        logger.error(f"RAG 컴포넌트 초기화 중 오류 발생: {str(e)}")
-        logger.error(traceback.format_exc())
-        logger.warning("RAG 기능 비활성화됨.")
-        # 실패 시 관련 객체 None으로 설정
-        qdrant_client_instance = None
-        embedding_model = None
-        vector_store = None
-else:
-    logger.warning("로컬 LLM 로딩 실패로 RAG 컴포넌트 초기화를 건너뛰었습니다.")
-
-# LangGraph 그래프 빌드 (RAG 컴포넌트 성공 시)
-if rag_components_initialized:
-    try:
-        logger.info("Building LangGraph workflow...")
-        workflow = StateGraph(GraphState)
-        workflow.add_node("retrieve", retrieve_node)
-        workflow.add_node("generate_rag_answer", generate_rag_answer_node)
-        workflow.add_node("summarize", summarize_answer_node)
-        workflow.set_entry_point("retrieve")
-        workflow.add_edge("retrieve", "generate_rag_answer")
-        workflow.add_edge("generate_rag_answer", "summarize")
-        workflow.add_edge("summarize", END)
-        langgraph_app = workflow.compile()
-        logger.info("LangGraph workflow compiled successfully.")
-    except Exception as e:
-         logger.error(f"LangGraph workflow compilation failed: {e}")
-         logger.error(traceback.format_exc())
-         langgraph_app = None
-else:
-    logger.warning("RAG components not initialized, skipping LangGraph workflow compilation.")
+# --- [요약용 수정] 요약 전용 LLM 파이프라인 생성 ---
+if local_llm: # 기본 LLM 생성 성공 시에만 시도
+     try:
+         logger.info("Creating dedicated pipeline for summarization...")
+         summarization_pipe = pipeline(
+             "text-generation",
+             model=model, # 동일 모델 사용
+             tokenizer=tokenizer, # 동일 토크나이저 사용
+             max_new_tokens=1024, # <<< 요약 최대 토큰 수 제한 (필요시 조절)
+             temperature=0.3,    # <<< 낮은 temperature 설정
+             do_sample=True,        # <<< 샘플링 활성화 (UserWarning 해결 시도)
+             top_p=0.9,
+             repetition_penalty=1.4,
+             device_map="auto"   # device_map 설정 유지
+         )
+         summarization_llm = HuggingFacePipeline(pipeline=summarization_pipe)
+         logger.info("HuggingFacePipeline for Summarization created.")
+     except Exception as e:
+         logger.error(f"Failed to create summarization pipeline: {e}")
+         summarization_llm = None # 실패 시 None 처리
+# --- 수정 끝 ---
 
 torch.cuda.empty_cache()  # GPU 메모리 캐시 정리
 
@@ -284,7 +393,7 @@ class ChatResponse(BaseModel):
 def generate_response(messages, max_tokens=2048, temperature=0.7):
     # 모델이 로드되지 않은 경우 기본 응답 반환
     if model is None or tokenizer is None:
-        return get_fallback_response("")
+        return get_fallback_response("") # type: ignore
     
     # 사용자 메시지 로깅
     last_user_message = ""
@@ -398,7 +507,7 @@ def generate_response(messages, max_tokens=2048, temperature=0.7):
 async def generate_stream_response(messages, max_tokens=2048, temperature=0.7):
     # 모델이 로드되지 않은 경우
     if model is None or tokenizer is None:
-        yield f"data: {get_fallback_response('')}\n\n"
+        yield f"data: {get_fallback_response('')}\n\n" # type: ignore
         yield f"data: [DONE]\n\n"
         return
     
@@ -536,7 +645,7 @@ def retrieve_node(state):
         state["error"] = f"Document retrieval failed: {e}"
         return state
 
-def generate_rag_answer_node(state: GraphState):
+def generate_rag_answer_node(state: GraphState): # type: ignore
     """ 검색된 문서와 질문으로 초기 RAG 답변 생성 """
     logger.info("--- Node: generate_rag_answer ---")
     question = state['question']
@@ -622,7 +731,7 @@ Provide a direct answer focusing on the key information:
             logger.error(f"Error during initial RAG answer generation: {e}")
             return {"initial_answer": "", "error": f"RAG answer generation failed: {str(e)}"}
 
-def summarize_answer_node(state: GraphState):
+def summarize_answer_node(state: GraphState): # type: ignore
     """초기 RAG 답변을 요약하고, 초기 답변과 요약 모두 반환하는 노드"""
     logger.info("--- Node: summarize_answer ---")
     initial_answer = state['initial_answer']
@@ -795,4 +904,15 @@ def init_qdrant_client():
 # 메인 실행
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    try:
+        print("서버를 시작합니다...")
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",
+            port=8000,
+            reload=True,
+            reload_dirs=["./"]
+        )
+    except Exception as e:
+        print(f"서버 시작 중 오류 발생: {e}")
+        print(traceback.format_exc()) 
