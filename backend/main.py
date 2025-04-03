@@ -12,12 +12,13 @@ import uuid
 import asyncio
 from fastapi.responses import StreamingResponse
 import sys
-from langchain.llms import HuggingFacePipeline
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Qdrant
+from langchain_community.llms import HuggingFacePipeline
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Qdrant
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
 from huggingface_hub import login, snapshot_download
 import qdrant_client
 import traceback
@@ -61,6 +62,12 @@ ENV = os.getenv("ENV", "development")
 LOCAL_BASE_MODEL_PATH = os.getenv("LOCAL_BASE_MODEL_PATH")
 LOCAL_ADAPTER_PATH = os.getenv("LOCAL_ADAPTER_PATH")
 
+# Qdrant 설정
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "regulatory_docs")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+
 # 모델 설정
 BASE_MODEL = "meta-llama/Llama-2-13b-chat-hf"
 ADAPTER_REPO = "Sean-Ong/STA_Reg"
@@ -73,11 +80,24 @@ tokenizer = None
 base_model = None
 local_llm = None
 summarization_llm = None
+is_initialized = False
+qdrant_client_instance = None
+embedding_model = None
+vector_store = None
+langgraph_app = None
+
+# 디바이스 설정
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
 
 def initialize_model_and_tokenizer():
     """모델과 토크나이저 초기화 (한 번만 실행)"""
-    global model, tokenizer, base_model, local_llm, summarization_llm
+    global model, tokenizer, base_model, local_llm, summarization_llm, is_initialized
     
+    if is_initialized:
+        logger.info("모델이 이미 초기화되어 있습니다.")
+        return True
+        
     try:
         if ENV == "development":
             logger.info("개발 환경: 로컬 모델 사용")
@@ -101,10 +121,57 @@ def initialize_model_and_tokenizer():
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
             
+            # 디바이스 매핑 설정
+            device_map = {
+                "model.embed_tokens": 0,
+                "model.norm": 0,
+                "lm_head": 0,
+                "model.layers.0": 0,
+                "model.layers.1": 0,
+                "model.layers.2": 0,
+                "model.layers.3": 0,
+                "model.layers.4": 0,
+                "model.layers.5": 0,
+                "model.layers.6": 0,
+                "model.layers.7": 0,
+                "model.layers.8": 0,
+                "model.layers.9": 0,
+                "model.layers.10": 0,
+                "model.layers.11": 0,
+                "model.layers.12": 0,
+                "model.layers.13": 0,
+                "model.layers.14": 0,
+                "model.layers.15": 0,
+                "model.layers.16": 0,
+                "model.layers.17": 0,
+                "model.layers.18": 0,
+                "model.layers.19": 0,
+                "model.layers.20": 0,
+                "model.layers.21": 0,
+                "model.layers.22": 0,
+                "model.layers.23": 0,
+                "model.layers.24": 0,
+                "model.layers.25": 0,
+                "model.layers.26": 0,
+                "model.layers.27": 0,
+                "model.layers.28": 0,
+                "model.layers.29": 0,
+                "model.layers.30": 0,
+                "model.layers.31": 0,
+                "model.layers.32": 0,
+                "model.layers.33": 0,
+                "model.layers.34": 0,
+                "model.layers.35": 0,
+                "model.layers.36": 0,
+                "model.layers.37": 0,
+                "model.layers.38": 0,
+                "model.layers.39": 0
+            }
+            
             # 기본 모델 로드
             base_model = AutoModelForCausalLM.from_pretrained(
                 LOCAL_BASE_MODEL_PATH,
-                device_map="auto",
+                device_map=device_map,
                 quantization_config=quantization_config,
                 torch_dtype=torch.float16,
                 offload_folder=OFFLOAD_DIR
@@ -115,19 +182,23 @@ def initialize_model_and_tokenizer():
             model = PeftModel.from_pretrained(
                 base_model,
                 LOCAL_ADAPTER_PATH,
-                device_map="auto",
+                device_map=device_map,
                 offload_folder=OFFLOAD_DIR
             )
+            
+            # 모델을 평가 모드로 설정
+            model.eval()
             
             # 기본 파이프라인 생성
             pipe = pipeline(
                 "text-generation",
-                model=model,
+                model=model.base_model,
                 tokenizer=tokenizer,
                 max_new_tokens=512,
                 temperature=0.7,
                 do_sample=True,
-                device_map="auto"
+                device_map=device_map,
+                torch_dtype=torch.float16
             )
             local_llm = HuggingFacePipeline(pipeline=pipe)
             logger.info("기본 LLM 파이프라인 생성 완료")
@@ -135,29 +206,27 @@ def initialize_model_and_tokenizer():
             # 요약용 파이프라인 생성
             summarization_pipe = pipeline(
                 "text-generation",
-                model=model,
+                model=model.base_model,
                 tokenizer=tokenizer,
                 max_new_tokens=1024,
                 temperature=0.3,
                 do_sample=True,
-                device_map="auto"
+                device_map=device_map,
+                torch_dtype=torch.float16
             )
             summarization_llm = HuggingFacePipeline(pipeline=summarization_pipe)
             logger.info("요약용 파이프라인 생성 완료")
             
+            is_initialized = True
             return True
         else:
             logger.info("프로덕션 환경: 원격 모델 사용")
-            # 프로덕션 환경 코드...
             return False
             
     except Exception as e:
         logger.error(f"모델 초기화 중 오류 발생: {e}")
         logger.error(traceback.format_exc())
         return False
-
-# 초기 모델 로드 실행
-initialize_model_and_tokenizer()
 
 # 4비트 양자화 설정
 quantization_config = BitsAndBytesConfig(
@@ -168,138 +237,55 @@ quantization_config = BitsAndBytesConfig(
     llm_int8_enable_fp32_cpu_offload=True
 )
 
-def ensure_model_cached(repo_id, cache_dir):
-    """모델 캐시 확인 및 다운로드"""
-    cache_path = os.path.join(cache_dir, repo_id.replace('/', '--'))
-    if not os.path.exists(cache_path):
-        logger.info(f"캐시 미발견, 다운로드 시작: {repo_id}")
-        return snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            token=os.getenv("HF_TOKEN")
-        )
-    logger.info(f"캐시된 모델 사용: {cache_path}")
-    return cache_path
-
-def load_model_and_tokenizer():
-    """환경에 따른 모델 및 토크나이저 로드"""
-    global local_llm  # local_llm을 전역 변수로 선언
-    
-    try:
-        # 토크나이저 로드
-        if ENV == "development":
-            logger.info("개발 환경: 로컬 모델 사용")
-            tokenizer = AutoTokenizer.from_pretrained(
-                LOCAL_BASE_MODEL_PATH,
-                use_fast=True,
-                padding_side="left"
-            )
-        else:
-            logger.info("프로덕션 환경: 캐시된 모델 사용")
-            model_path = ensure_model_cached(BASE_MODEL, MODEL_CACHE_DIR)
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                use_fast=True,
-                padding_side="left",
-                token=os.getenv("HF_TOKEN")
-            )
-        
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        # 기본 모델 로드
-        base_model = AutoModelForCausalLM.from_pretrained(
-            LOCAL_BASE_MODEL_PATH if ENV == "development" else BASE_MODEL,
-            device_map="auto",
-            quantization_config=quantization_config,
-            torch_dtype=torch.float16,
-            offload_folder=OFFLOAD_DIR,
-            token=os.getenv("HF_TOKEN") if ENV != "development" else None
-        )
-
-        # QLoRA 어댑터 로드
-        if ENV == "development":
-            logger.info(f"로컬 어댑터 로드: {LOCAL_ADAPTER_PATH}")
-            model = PeftModel.from_pretrained(
-                base_model,
-                LOCAL_ADAPTER_PATH,
-                device_map="auto",
-                offload_folder=OFFLOAD_DIR
-            )
-        else:
-            logger.info("원격 어댑터 로드")
-            adapter_path = ensure_model_cached(ADAPTER_REPO, MODEL_CACHE_DIR)
-            model = PeftModel.from_pretrained(
-                base_model,
-                adapter_path,
-                device_map="auto",
-                offload_folder=OFFLOAD_DIR,
-                token=os.getenv("HF_TOKEN")
-            )
-            
-        # local_llm 초기화
-        pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=512,
-            temperature=0.7,
-            do_sample=True,
-            device_map="auto"
-        )
-        local_llm = HuggingFacePipeline(pipeline=pipe)
-        logger.info("LLM 파이프라인 생성 완료")
-
-        return model, tokenizer
-
-    except Exception as e:
-        logger.error(f"모델 로드 중 오류 발생: {e}")
-        logger.error(traceback.format_exc())
-        return None, None
-
-# 모델 로드 실행
-try:
-    model, tokenizer = load_model_and_tokenizer()
-    if model is None or tokenizer is None:
-        logger.warning("모델 또는 토크나이저 로드 실패. 서버는 제한된 기능으로 실행됩니다.")
-    else:
-        logger.info("모델과 토크나이저가 성공적으로 로드되었습니다.")
-except Exception as e:
-    logger.error(f"모델 초기화 중 오류 발생: {e}")
-    logger.error(traceback.format_exc())
-    model, tokenizer = None, None
-
-# RAG 설정
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-COLLECTION_NAME = "fcc_kdb_docs"
-EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5"
-SEARCH_K = 3
-
 @app.on_event("startup")
 async def startup_event():
+    """서버 시작 시 초기화"""
     global qdrant_client_instance, embedding_model, vector_store, langgraph_app
     
     try:
+        # 모델 초기화
+        if not initialize_model_and_tokenizer():
+            logger.error("모델 초기화 실패")
+            return
+            
         # Qdrant 클라이언트 초기화
         qdrant_client_instance = QdrantClient(
             host=QDRANT_HOST,
             port=QDRANT_PORT
         )
         
-        # 컬렉션 존재 여부 확인
+        # 컬렉션 존재 여부 확인 및 생성
         try:
             collection_info = qdrant_client_instance.get_collection(collection_name=COLLECTION_NAME)
             logger.info(f"Qdrant 컬렉션 '{COLLECTION_NAME}' 확인 완료")
         except Exception as q_err:
-            logger.error(f"Qdrant 컬렉션 오류: {q_err}")
-            return
+            logger.warning(f"Qdrant 컬렉션 '{COLLECTION_NAME}'이 존재하지 않습니다. 새로 생성합니다.")
+            try:
+                # 임베딩 모델 초기화
+                embedding_model = HuggingFaceEmbeddings(
+                    model_name=EMBEDDING_MODEL_NAME,
+                    model_kwargs={'device': device}
+                )
+                
+                # 컬렉션 생성
+                qdrant_client_instance.create_collection(
+                    collection_name=COLLECTION_NAME,
+                    vectors_config=qdrant_models.VectorParams(
+                        size=384,  # MiniLM-L6-v2 임베딩 크기
+                        distance=qdrant_models.Distance.COSINE
+                    )
+                )
+                logger.info(f"Qdrant 컬렉션 '{COLLECTION_NAME}' 생성 완료")
+            except Exception as create_err:
+                logger.error(f"Qdrant 컬렉션 생성 실패: {create_err}")
+                return
         
-        # 임베딩 모델 초기화
-        embedding_model = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
-        )
+        # 임베딩 모델 초기화 (아직 초기화되지 않은 경우)
+        if embedding_model is None:
+            embedding_model = HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL_NAME,
+                model_kwargs={'device': device}
+            )
         logger.info("임베딩 모델 로드 완료")
         
         # 벡터 저장소 초기화
@@ -311,20 +297,26 @@ async def startup_event():
         logger.info("벡터 저장소 초기화 완료")
         
         # LangGraph 워크플로우 빌드
-        workflow = StateGraph(GraphState)
-        workflow.add_node("retrieve", retrieve_node)
-        workflow.add_node("generate_rag_answer", generate_rag_answer_node)
-        workflow.add_node("summarize", summarize_answer_node)
-        workflow.set_entry_point("retrieve")
-        workflow.add_edge("retrieve", "generate_rag_answer")
-        workflow.add_edge("generate_rag_answer", "summarize")
-        workflow.add_edge("summarize", END)
-        langgraph_app = workflow.compile()
-        logger.info("LangGraph 워크플로우 컴파일 완료")
+        try:
+            workflow = StateGraph(GraphState)
+            workflow.add_node("retrieve", retrieve_node)
+            workflow.add_node("generate_rag_answer", generate_rag_answer_node)
+            workflow.add_node("summarize", summarize_answer_node)
+            workflow.set_entry_point("retrieve")
+            workflow.add_edge("retrieve", "generate_rag_answer")
+            workflow.add_edge("generate_rag_answer", "summarize")
+            workflow.add_edge("summarize", END)
+            langgraph_app = workflow.compile()
+            logger.info("LangGraph 워크플로우 컴파일 완료")
+        except Exception as graph_err:
+            logger.error(f"LangGraph 워크플로우 컴파일 실패: {graph_err}")
+            logger.error(traceback.format_exc())
+            langgraph_app = None
         
     except Exception as e:
         logger.error(f"startup_event 오류: {e}")
         logger.error(traceback.format_exc())
+        langgraph_app = None
 
 # 기본 LLM 파이프라인 생성
 if model is not None and tokenizer is not None:
@@ -645,91 +637,78 @@ def retrieve_node(state):
         state["error"] = f"Document retrieval failed: {e}"
         return state
 
-def generate_rag_answer_node(state: GraphState): # type: ignore
-    """ 검색된 문서와 질문으로 초기 RAG 답변 생성 """
+def generate_rag_answer_node(state: GraphState):
+    """검색된 문서와 질문으로 초기 RAG 답변 생성"""
     logger.info("--- Node: generate_rag_answer ---")
-    question = state['question']
     
-    # documents 키가 없는 경우 처리
-    if 'documents' not in state:
-        logger.warning("No documents key in state, initializing empty list")
-        state['documents'] = []
-    
-    documents = state['documents']
-    
-    if state.get('error'):
-        logger.warning("Skipping RAG generation due to previous error.")
-        return {"initial_answer": ""}
-
-    if not documents:
-        logger.warning("No documents found, generating response without context.")
-        # QLoRA 모델을 사용한 직접 답변 생성
-        prompt_input = f"""<s>[INST] <<SYS>>
-You are a certification expert specializing in RF regulations. Provide a clear and accurate answer based on your knowledge.
+    try:
+        question = state['question']
+        documents = state.get('documents', [])
+        
+        if not documents:
+            logger.warning("문서가 없어 직접 답변 생성")
+            prompt_input = f"""<s>[INST] <<SYS>>
+You are a certification expert specializing in RF regulations. Provide a comprehensive and detailed answer based on your knowledge.
 <</SYS>>
 
 Question: {question}
 
-Provide a direct and informative answer:
+Provide a detailed and informative answer that includes:
+1. Definition and explanation
+2. Key technical specifications
+3. Regulatory requirements
+4. Practical implications
 [/INST]"""
-        try:
             response = local_llm.invoke(prompt_input)
             if "[/INST]" in response:
                 response = response.split("[/INST]")[-1].strip()
             return {"initial_answer": response, "error": None}
-        except Exception as e:
-            logger.error(f"Error during direct answer generation: {e}")
-            return {"initial_answer": "", "error": f"Direct answer generation failed: {str(e)}"}
-    else:
-        # 검색된 문서 내용을 컨텍스트로 조합
+            
+        # 문서 내용 조합
         context_parts = []
         for doc in documents:
             score = doc.metadata.get('score', 'N/A')
             content = doc.page_content
-            # 관련성 점수가 높은 문서 우선 배치
             context_parts.append(f"[관련성 점수: {score}]\n{content}")
         
-        # 관련성 점수 기준으로 정렬
-        context_parts.sort(key=lambda x: float(x.split(": ")[1].split("]")[0]) if "관련성 점수:" in x else 0, reverse=True)
         context = "\n\n".join(context_parts)
-
-        # 개선된 RAG 프롬프트
+        
+        # RAG 프롬프트 생성
         prompt_input = f"""<s>[INST] <<SYS>>
-You are a certification expert specializing in RF regulations. Your task is to provide clear, direct answers based on the provided information.
+You are a certification expert specializing in RF regulations. Your task is to provide a comprehensive and detailed answer based on the provided information.
 
-Guidelines:
-1. If you find a direct answer in the provided information, use it as the primary source
-2. If multiple sources provide similar information, combine them for a comprehensive answer
-3. If the information is related but not directly answering the question, explain what information is available
-4. If the information is not relevant or missing, clearly state that you cannot find a specific answer
-5. Focus on factual information and technical specifications
-6. Include relevant FCC rules or guidelines when mentioned in the sources
-
+Guidelines for answering:
+1. Start with a clear definition and explanation
+2. Include all relevant technical specifications
+3. Explain regulatory requirements in detail
+4. Provide practical implications and applications
+5. Use specific examples when possible
+6. Ensure technical accuracy while being clear and understandable
 <</SYS>>
 
-Based on the following information, please provide a precise answer:
+Based on the following information, please provide a comprehensive answer:
 
 Information:
 {context}
 
 Question: {question}
 
-Provide a direct answer focusing on the key information:
+Provide a detailed answer that covers all aspects of the question:
 [/INST]"""
-
-        try:
-            # 로컬 LLM 호출
+        
+        # 텐서를 올바른 디바이스로 이동
+        with torch.cuda.device(device):
             response = local_llm.invoke(prompt_input)
             
-            # 프롬프트 제거
-            if "[/INST]" in response:
-                response = response.split("[/INST]")[-1].strip()
-            
-            logger.info(f"Generated initial RAG answer (length: {len(response)}).")
-            return {"initial_answer": response, "error": None}
-        except Exception as e:
-            logger.error(f"Error during initial RAG answer generation: {e}")
-            return {"initial_answer": "", "error": f"RAG answer generation failed: {str(e)}"}
+        if "[/INST]" in response:
+            response = response.split("[/INST]")[-1].strip()
+        
+        logger.info(f"Generated initial RAG answer (length: {len(response)})")
+        return {"initial_answer": response, "error": None}
+        
+    except Exception as e:
+        logger.error(f"Error during initial RAG answer generation: {e}")
+        return {"initial_answer": "", "error": str(e)}
 
 def summarize_answer_node(state: GraphState): # type: ignore
     """초기 RAG 답변을 요약하고, 초기 답변과 요약 모두 반환하는 노드"""
@@ -756,29 +735,36 @@ def summarize_answer_node(state: GraphState): # type: ignore
 
     # 요약 프롬프트 정의
     prompt_input = f"""<s>[INST] <<SYS>>
-You are a certification expert specializing in RF regulations. Your task is to provide a clear and concise summary of the technical information.
+You are a certification expert specializing in RF regulations. Your task is to provide a clear and comprehensive summary of the technical information.
 
 Guidelines for summarization:
-1. Focus on the key technical specifications and requirements
-2. Include specific FCC rules or guidelines mentioned
-3. Maintain technical accuracy while being concise
-4. Avoid generic phrases or non-technical language
-5. If the answer is already concise and technical, return it as is
-6. Ensure the summary directly answers the original question
+1. Start with a clear definition
+2. Include key technical specifications
+3. Explain regulatory requirements
+4. Provide practical implications
+5. Maintain technical accuracy while being concise
+6. Use bullet points or numbered lists for clarity
+7. Include specific examples when relevant
 
 Format your response as:
-TECHNICAL SUMMARY:
-[2-3 concise sentences with key technical information]
+DEFINITION:
+[Clear definition of the concept]
 
-RELEVANT SPECIFICATIONS:
-[List specific technical requirements or FCC rules]
+TECHNICAL SPECIFICATIONS:
+[Key technical details and requirements]
+
+REGULATORY REQUIREMENTS:
+[Specific regulatory standards and guidelines]
+
+PRACTICAL IMPLICATIONS:
+[How this applies in real-world scenarios]
 
 <</SYS>>
 
 Content to summarize:
 {processed_answer}
 
-Provide a focused technical summary:
+Provide a comprehensive technical summary:
 [/INST]"""
 
     try:
@@ -816,6 +802,8 @@ Provide a focused technical summary:
 # API 엔드포인트
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
+    global langgraph_app
+    
     # 스트리밍 요청은 아직 LangGraph RAG 미지원
     if request.stream:
         logger.warning("Streaming is not supported with the LangGraph RAG pipeline.")
