@@ -49,10 +49,9 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
+# 모델 설정
 BASE_MODEL = "meta-llama/Llama-2-13b-chat-hf"
 ADAPTER_REPO = "Sean-Ong/STA_Reg"
-
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, token=os.getenv("HF_TOKEN"))
 
 # offload 디렉토리 설정
 OFFLOAD_DIR = "./offload"
@@ -66,9 +65,16 @@ quantization_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_use_double_quant=True,
-    llm_int8_enable_fp32_cpu_offload=True  # CPU 오프로드 활성화
+    llm_int8_enable_fp32_cpu_offload=True
 )
 
+# 토크나이저 로드
+tokenizer = AutoTokenizer.from_pretrained(
+    BASE_MODEL, 
+    token=os.getenv("HF_TOKEN")
+)
+
+# 기본 모델 로드
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     device_map="auto",
@@ -76,9 +82,10 @@ base_model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float16,
     offload_folder=OFFLOAD_DIR,
     token=os.getenv("HF_TOKEN"),
-    low_cpu_mem_usage=True  # 낮은 CPU 메모리 사용
+    low_cpu_mem_usage=True
 )
 
+# QLoRA 어댑터 로드
 model = PeftModel.from_pretrained(
     base_model,
     ADAPTER_REPO,
@@ -86,16 +93,12 @@ model = PeftModel.from_pretrained(
     token=os.getenv("HF_TOKEN")
 )
 
-# 모델 경로 설정
-MODEL_DIR = r"C:\Regluatory SaaS\Platform SaaS\Machine Learning\fcc_llama2_13b_chat_qlora_final\model_20250326"
-BASE_MODEL = "meta-llama/Llama-2-13b-chat-hf"
-
 # --- RAG 설정 추가 ---
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost") # Qdrant 서버 주소
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))      # Qdrant 서버 포트
-COLLECTION_NAME = "fcc_kdb_docs" # Qdrant 컬렉션 이름
-EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5" # 임베딩 모델
-SEARCH_K = 3 # 검색할 문서 개수
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+COLLECTION_NAME = "fcc_kdb_docs"
+EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5"
+SEARCH_K = 3
 
 # --- LangGraph 상태 정의 ---
 class GraphState(TypedDict):
@@ -138,7 +141,7 @@ async def status():
     return {
         "status": "online",
         "model_loaded": model is not None and tokenizer is not None,
-        "model_path": MODEL_DIR,
+        "model_path": OFFLOAD_DIR,
         "base_model": BASE_MODEL
     }
 
@@ -147,8 +150,8 @@ def load_model():
     logger.info("모델 로딩 중...")
     
     # 경로 존재 여부 확인
-    if not os.path.exists(MODEL_DIR):
-        logger.error(f"모델 경로가 존재하지 않습니다: {MODEL_DIR}")
+    if not os.path.exists(OFFLOAD_DIR):
+        logger.error(f"모델 경로가 존재하지 않습니다: {OFFLOAD_DIR}")
         return None, None
     
     # 4비트 양자화 설정
@@ -186,7 +189,7 @@ def load_model():
         # QLoRA 어댑터 로드
         logger.info("QLoRA 어댑터 로딩 중...")
         try:
-            model = PeftModel.from_pretrained(model, MODEL_DIR)
+            model = PeftModel.from_pretrained(model, OFFLOAD_DIR)
             logger.info("모델 로딩 완료")
             return model, tokenizer
         except Exception as e:
