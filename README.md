@@ -1,4 +1,4 @@
-# 곧 폐쇄 합니다~~처남
+# 곧 폐쇄 합니다~~처남 => 새롭게 Sean-Seongho-Ong/Chatbot 을 사용해~~
 
 # QLoRA LLM 챗봇 웹 인터페이스
 
