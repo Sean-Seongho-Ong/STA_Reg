@@ -1,3 +1,5 @@
+#곧 폐쇄 합니다~~처남
+
 # QLoRA LLM 챗봇 웹 인터페이스
 
 이 프로젝트는 QLoRA 방식으로 미세 조정된 LLM(Large Language Model) 기반 챗봇을 위한 웹 인터페이스를 제공합니다.
